@@ -48,19 +48,23 @@
 
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 1.5rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 2rem;
   margin-bottom: 2rem;
 }
 
 .metric-card {
   background: white;
   border-radius: 16px;
-  padding: 1.5rem;
+  padding: 2.4rem 2rem;
+  min-height: 260px;
   box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
   transition: transform 0.2s, box-shadow 0.2s;
   position: relative;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
 
 .metric-card::before {
@@ -86,11 +90,11 @@
 }
 
 .metric-icon {
-  font-size: 2rem;
+  font-size: 2.4rem;
 }
 
 .metric-title {
-  font-size: 1rem;
+  font-size: 1.1rem;
   font-weight: 600;
   color: #6b7280;
   margin: 0;
@@ -106,20 +110,20 @@
 }
 
 .value-number {
-  font-size: 2.5rem;
+  font-size: 3.4rem;
   font-weight: 700;
   color: #1f2937;
   line-height: 1;
 }
 
 .value-unit {
-  font-size: 1rem;
+  font-size: 1.15rem;
   color: #6b7280;
   font-weight: 500;
 }
 
 .metric-status {
-  font-size: 0.75rem;
+  font-size: 0.85rem;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 1px;
@@ -259,6 +263,71 @@
   backdrop-filter: blur(10px);
 }
 
+.pollutant-detection {
+  margin-bottom: 2rem;
+  background: rgba(255, 255, 255, 0.95);
+  border-radius: 16px;
+  padding: 1.5rem;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.16);
+  border: 3px solid #111827;
+}
+
+.pollutant-detection h2 {
+  margin: 0 0 0.75rem;
+  color: #111827;
+  font-size: 1.9rem;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+}
+
+.pollutant-detection h3 {
+  margin: 1rem 0 0.6rem;
+  color: #111827;
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+.pollutant-badge {
+  display: inline-block;
+  margin: 0;
+  padding: 0.55rem 1rem;
+  border-radius: 10px;
+  border: 2px solid #111827;
+  font-size: 1.05rem;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+}
+
+.pollutant-badge.normal {
+  background: #dcfce7;
+  color: #14532d;
+}
+
+.pollutant-badge.alert {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.pollutant-subtitle {
+  margin: 0.7rem 0 0.5rem;
+  color: #1f2937;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.pollutant-detection ul {
+  margin: 0;
+  padding-left: 1.2rem;
+  color: #111827;
+}
+
+.pollutant-detection li {
+  margin: 0.45rem 0;
+  line-height: 1.5;
+  font-size: 0.98rem;
+  font-weight: 600;
+}
+
 @media (max-width: 768px) {
   .dashboard {
     padding: 1rem;
@@ -276,10 +345,34 @@
 
   .metrics-grid {
     grid-template-columns: 1fr;
+    gap: 1.25rem;
   }
 
   .value-number {
-    font-size: 2rem;
+    font-size: 2.6rem;
   }
 }
+
+@media (max-width: 1200px) {
+  .metrics-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1.25rem;
+  }
+
+  .metric-card {
+    padding: 1.8rem 1.4rem;
+    min-height: 220px;
+  }
+
+  .value-number {
+    font-size: 2.6rem;
+  }
+}
+
+@media (max-width: 1024px) {
+  .metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 

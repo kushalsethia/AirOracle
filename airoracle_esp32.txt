@@ -1,0 +1,403 @@
+// ===============================================================
+
+#include <Wire.h>
+#include <SensirionI2cScd4x.h>
+#include "Adafruit_PM25AQI.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "esp_eap_client.h"
+#include "Adafruit_SGP30.h"
+#include <Preferences.h>
+#include <esp_system.h>
+
+// ==========================================
+// 1. CONFIGURATION & TINYML
+// ==========================================
+#define RESET_BASELINE false // Set to true once to clear memory, then back to false
+#include "model.h"
+#include <tflm_esp32.h>
+#include <eloquent_tinyml.h>
+#define TF_NUM_OPS 10
+#define ARENA_SIZE 8000
+Eloquent::TF::Sequential<TF_NUM_OPS, ARENA_SIZE> tf;
+
+// Supabase Configuration
+const char* SUPABASE_URL = "https://qoemgprjxduzmolnldvc.supabase.co/rest/v1/air_quality";
+const char* SUPABASE_PUBLISHABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFvZW1ncHJqeGR1em1vbG5sZHZjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ5MTM5NzksImV4cCI6MjA5MDQ4OTk3OX0.kmXtsDINJU3LI0CvagrLN7m-z9JTYs6tsscANhwijlg";
+
+// Eduroam Credentials
+const char* ssid = "eduroam";
+#define EAP_IDENTITY "ksethia@trincoll.edu"
+#define EAP_USERNAME "ksethia@trincoll.edu"
+#define EAP_PASSWORD "iloveKhushi#2201"
+
+// TinyML Parameters (6 Features: CO2, VOC, PM1.0, PM2.5, PM10, Temp)
+float means[]   = {669.204f, 374.239f, 56.825f, 175.141f, 230.178f, 22.482f};
+float stds[]    = {132.161f, 2347.996f, 173.389f, 409.243f, 577.341f, 1.152f};
+float weights[] = {0.5f, 2.0f, 2.0f, 2.0f, 2.0f, 0.5f};
+const char* labels[] = {"Normal", "Smoking", "Vape", "Candle", "Window", "Paper"};
+
+// Filtering & Prediction
+#define FILTER_SIZE 5
+int predictionHistory[FILTER_SIZE] = {0};
+int filterIdx = 0;
+String currentPrediction = "Wait...";
+
+// ==========================================
+// 2. PIN DEFINITIONS & GLOBALS
+// ==========================================
+#define SDA1 22
+#define SCL1 20
+#define SDA2 21
+#define SCL2 19
+#define RX_PIN 7
+#define TX_PIN 8
+#define ZE07_PIN 34
+
+TwoWire I2C_OLED = TwoWire(1);
+Preferences preferences;
+SensirionI2cScd4x scd4x;
+Adafruit_PM25AQI aqi;
+Adafruit_SGP30 sgp;
+Adafruit_SH1107 display = Adafruit_SH1107(128, 128, &I2C_OLED, -1);
+
+// Sensor values
+uint16_t g_co2 = 0;
+float    g_temp = 0.0f;
+float    g_hum  = 0.0f;
+uint16_t g_pm1_0 = 0, g_pm2_5 = 0, g_pm10 = 0, g_tvoc = 0;
+float    g_co_ppm = 0.0f;
+
+// Sensor init flags - don't touch a sensor in loop() if it didn't come up cleanly
+bool scdOk = false;
+bool sgpOk = false;
+bool pmsOk = false;
+bool mlOk  = false;
+
+// ZE07-CO calibration (0.32V measured zero-point, kept as requested)
+static const float ZE07_V0_V      = 0.32f;    // volts at 0 ppm (site-calibrated)
+static const float ZE07_SLOPE_PPM = 312.5f;   // ppm per volt (datasheet: 500ppm / (2.0-0.4)V)
+
+// Timers
+unsigned long lastInference    = 0;
+unsigned long lastOLED         = 0;
+unsigned long lastSupabase     = 0;
+unsigned long lastSaveBaseline = 0;
+unsigned long lastSGP          = 0;
+unsigned long lastWiFiCheck    = 0;
+
+bool isBurnInComplete = false;
+
+void updateOLED();
+void sendToSupabase();
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("Note: SGP30 requires 12hrs of initial operation for valid baseline.");
+
+    // --- INIT ML ---
+    tf.setNumInputs(6);
+    tf.setNumOutputs(6);
+    tf.resolver.AddFullyConnected();
+    tf.resolver.AddRelu();
+    tf.resolver.AddSoftmax();
+    if (!tf.begin(model_tflite).isOk()) {
+        Serial.println("ML Init Fail - rebooting in 2s");
+        delay(2000);
+        esp_restart();
+    }
+    mlOk = true;
+
+    // --- INIT OLED (secondary I2C bus) ---
+    I2C_OLED.begin(SDA2, SCL2);
+    display.begin(0x3D, true);
+    display.setRotation(1);
+
+    // --- INIT WIFI (WPA2-Enterprise / eduroam) ---
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    esp_eap_client_set_identity((uint8_t*)EAP_IDENTITY, strlen(EAP_IDENTITY));
+    esp_eap_client_set_username((uint8_t*)EAP_USERNAME, strlen(EAP_USERNAME));
+    esp_eap_client_set_password((uint8_t*)EAP_PASSWORD, strlen(EAP_PASSWORD));
+    esp_wifi_sta_enterprise_enable();
+    WiFi.begin(ssid);
+
+    // --- INIT SCD40 on primary I2C bus ---
+    Wire.begin(SDA1, SCL1);
+    // SCD4x uses I2C clock stretching. Some ESP32 board defs default Wire to 400kHz,
+    // which can cause the SCD40 to drop off the bus. Force 100kHz standard mode.
+    Wire.setClock(100000);
+    scd4x.begin(Wire, 0x62);
+
+    // Datasheet: start_periodic_measurement only works in idle state.
+    // Make sure we're idle (handles the warm-boot / soft-reset case).
+    scd4x.stopPeriodicMeasurement();
+    delay(500);
+    if (scd4x.startPeriodicMeasurement() == 0) {
+        scdOk = true;
+        Serial.println("SCD40: periodic measurement started.");
+    } else {
+        Serial.println("SCD40: failed to start periodic measurement.");
+    }
+
+    // --- INIT SGP30 on same primary I2C bus ---
+    if (sgp.begin(&Wire)) {
+        sgpOk = true;
+        preferences.begin("sgp30", false);
+        if (RESET_BASELINE) {
+            preferences.clear();
+            Serial.println("Baseline Memory Cleared. 12-Hour Burn-In Required.");
+            isBurnInComplete = false;
+        } else {
+            uint16_t tvoc_base = preferences.getUShort("tvoc", 0);
+            uint16_t eco2_base = preferences.getUShort("eco2", 0);
+            if (tvoc_base != 0) {
+                sgp.setIAQBaseline(eco2_base, tvoc_base);
+                Serial.println("Valid Baseline Loaded.");
+                isBurnInComplete = true;
+            } else {
+                Serial.println("No Baseline Found. 12-Hour Burn-In Required.");
+                isBurnInComplete = false;
+            }
+        }
+    } else {
+        Serial.println("SGP30: not found - TVOC readings disabled.");
+    }
+
+    // --- INIT PMS5003 on UART1 ---
+    Serial1.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+    if (aqi.begin_UART(&Serial1)) {
+        pmsOk = true;
+        Serial.println("PMS5003: UART initialized.");
+    } else {
+        Serial.println("PMS5003: UART init failed.");
+    }
+
+    // Prime all timers so the first loop iteration does not fire every branch
+    // with zero-valued sensor globals.
+    unsigned long t = millis();
+    lastInference    = t;
+    lastOLED         = t;
+    lastSupabase     = t;
+    lastSaveBaseline = t;
+    lastSGP          = t;
+    lastWiFiCheck    = t;
+}
+
+void loop() {
+    unsigned long now = millis();
+
+    // 1. WIFI WATCHDOG (safe non-blocking reconnect)
+    if (now - lastWiFiCheck >= 10000) {
+        lastWiFiCheck = now;
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi Link Lost. Attempting Reconnect...");
+            WiFi.begin(ssid);
+        }
+    }
+
+    // 2. SCD40 (poll data-ready status, read only when ready)
+    if (scdOk) {
+        bool ready = false;
+        if (scd4x.getDataReadyStatus(ready) == 0 && ready) {
+            if (scd4x.readMeasurement(g_co2, g_temp, g_hum) == 0) {
+                // Humidity compensation for SGP30 (Magnus-Tetens / Sensirion-recommended)
+                // absHum in g/m^3; Adafruit_SGP30::setHumidity expects mg/m^3 as uint32_t.
+                if (sgpOk) {
+                    float absHum = 216.7f
+                                 * ((g_hum / 100.0f) * 6.112f
+                                    * expf((17.62f * g_temp) / (243.12f + g_temp)))
+                                 / (273.15f + g_temp);
+                    sgp.setHumidity((uint32_t)(absHum * 1000.0f));
+                }
+            }
+        }
+    }
+
+    // 3. SGP30 (must be exactly 1 Hz for valid IAQ output)
+    if (sgpOk && now - lastSGP >= 1000) {
+        lastSGP = now;
+        if (sgp.IAQmeasure()) {
+            g_tvoc = sgp.TVOC;
+        }
+    }
+
+    // 4. ZE07-CO Analog Read
+    //    Use analogReadMilliVolts() so the ESP32 ADC calibration curve is applied.
+    //    Zero-point is intentionally 0.32 V (measured in clean air on this unit).
+    float voltage = analogReadMilliVolts(ZE07_PIN) / 1000.0f;
+    g_co_ppm = (voltage > ZE07_V0_V) ? (voltage - ZE07_V0_V) * ZE07_SLOPE_PPM : 0.0f;
+
+    // 5. PMS5003 UART Read
+    if (pmsOk) {
+        PM25_AQI_Data data;
+        if (aqi.read(&data)) {
+            // NOTE: Adafruit field naming is confusing. pm10_standard == PM1.0, not PM10.
+            g_pm1_0 = data.pm10_standard;
+            g_pm2_5 = data.pm25_standard;
+            g_pm10  = data.pm100_standard;
+        }
+    }
+
+    // 6. TinyML Inference + Temporal Filter (every 2s)
+    if (mlOk && now - lastInference >= 2000) {
+        lastInference = now;
+        float input[6] = {
+            (float)g_co2,
+            (float)g_tvoc,
+            (float)g_pm1_0,
+            (float)g_pm2_5,
+            (float)g_pm10,
+            g_temp
+        };
+        for (int i = 0; i < 6; i++) {
+            input[i] = ((input[i] - means[i]) / stds[i]) * weights[i];
+        }
+        if (tf.predict(input).isOk()) {
+            int currentClass = tf.classification;
+            float confidence = tf.outputs[currentClass];
+
+            // 70% confidence + majority voting over FILTER_SIZE predictions
+            predictionHistory[filterIdx] = (confidence >= 0.70f) ? currentClass : 0;
+            filterIdx = (filterIdx + 1) % FILTER_SIZE;
+
+            int counts[6] = {0};
+            for (int i = 0; i < FILTER_SIZE; i++) counts[predictionHistory[i]]++;
+
+            int winner = 0;
+            for (int i = 1; i < 6; i++) {
+                if (counts[i] > counts[winner]) winner = i;
+            }
+            currentPrediction = (counts[winner] >= 3) ? labels[winner] : "Normal";
+        }
+    }
+
+    // 7. Supabase Upload (every 20s)
+    if (now - lastSupabase >= 20000) {
+        lastSupabase = now;
+        if (WiFi.status() == WL_CONNECTED) sendToSupabase();
+    }
+
+    // 8. Save SGP30 Baseline to Flash (12h during burn-in, 1h after)
+    //    DO NOT call IAQmeasure() here - the SGP30's dynamic baseline algorithm
+    //    strictly requires exactly one IAQmeasure() per second. Step 3 already
+    //    keeps the sensor at 1Hz; calling it again here would double-sample and
+    //    skew the baseline. getIAQBaseline() is a pure I2C read of the sensor's
+    //    internal register and does not itself advance the algorithm.
+    if (sgpOk) {
+        unsigned long saveInterval = isBurnInComplete ? 3600000UL : 43200000UL;
+        if (now - lastSaveBaseline >= saveInterval) {
+            lastSaveBaseline = now;
+            uint16_t TVOC_base, eCO2_base;
+            if (sgp.getIAQBaseline(&eCO2_base, &TVOC_base)) {
+                preferences.putUShort("tvoc", TVOC_base);
+                preferences.putUShort("eco2", eCO2_base);
+                if (!isBurnInComplete) {
+                    Serial.println("12-Hour Burn-In Complete! First Baseline Saved.");
+                    isBurnInComplete = true;
+                } else {
+                    Serial.println("Rolling Baseline Updated.");
+                }
+            } else {
+                Serial.println("SGP30: getIAQBaseline() failed - skipping save.");
+            }
+        }
+    }
+
+    // 9. Update OLED (every 1s)
+    if (now - lastOLED >= 1000) {
+        lastOLED = now;
+        updateOLED();
+    }
+}
+
+void sendToSupabase() {
+    // 1. Always check WiFi status first
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Supabase Skip: No WiFi");
+        return;
+    }
+
+    // 2. Scoped block so client/http get destroyed (releases TLS socket + heap)
+    {
+        WiFiClientSecure client;
+        client.setInsecure();
+        // NOTE: setHandshakeTimeout() is in SECONDS. http.setTimeout() is in ms.
+        //       Using client.setTimeout(15) on ESP32 core 3.x is ambiguous (ms), so we avoid it.
+        client.setHandshakeTimeout(10);
+
+        HTTPClient http;
+        http.setTimeout(15000);
+
+        if (http.begin(client, SUPABASE_URL)) {
+            http.addHeader("Content-Type", "application/json");
+            http.addHeader("apikey", SUPABASE_PUBLISHABLE_KEY);
+            http.addHeader("Authorization", String("Bearer ") + SUPABASE_PUBLISHABLE_KEY);
+
+            // 3. Build JSON without String concatenation (prevents heap fragmentation)
+            char body[384];
+            int n = snprintf(body, sizeof(body),
+                "{"
+                "\"temperature\":%.2f,"
+                "\"humidity\":%.2f,"
+                "\"co2\":%u,"
+                "\"pm1_0\":%u,"
+                "\"pm2_5\":%u,"
+                "\"pm10\":%u,"
+                "\"carbon_monoxide\":%.2f,"
+                "\"voc\":%u,"
+                "\"prediction\":\"%s\""
+                "}",
+                g_temp, g_hum, g_co2,
+                g_pm1_0, g_pm2_5, g_pm10,
+                g_co_ppm, g_tvoc,
+                currentPrediction.c_str());
+
+            if (n > 0 && n < (int)sizeof(body)) {
+                int code = http.POST((uint8_t*)body, n);
+                Serial.printf("Cloud Sync: %d\n", code);
+            } else {
+                Serial.println("Supabase Error: JSON build truncated");
+            }
+
+            // 4. Cleanup: end() clears payload, stop() kills SSL socket
+            http.end();
+            client.stop();
+        } else {
+            Serial.println("Supabase Error: Connection failed");
+        }
+    }
+}
+
+void updateOLED() {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.fillRect(0, 0, 128, 12, SH110X_WHITE);
+    display.setTextColor(SH110X_BLACK);
+    display.print(" STATUS: "); display.print(currentPrediction);
+    display.setTextColor(SH110X_WHITE);
+
+    display.setCursor(0, 16); display.printf("CO2:  %u ppm", g_co2);
+    display.setCursor(0, 26); display.printf("VOC:  %u ppb", g_tvoc);
+    display.setCursor(0, 36); display.printf("CO:   %.1f ppm", g_co_ppm);
+
+    display.setCursor(0, 46); display.println("---------------------");
+
+    display.setCursor(0, 56); display.printf("PM1.0: %u", g_pm1_0);
+    display.setCursor(0, 66); display.printf("PM2.5: %u", g_pm2_5);
+    display.setCursor(0, 76); display.printf("PM10:  %u", g_pm10);
+
+    display.setCursor(0, 86); display.println("---------------------");
+
+    display.setCursor(0, 96);  display.printf("Temp: %.1f C", g_temp);
+    display.setCursor(0, 106); display.printf("WiFi: %s",
+        (WiFi.status() == WL_CONNECTED) ? "OK" : "--");
+
+    display.display();
+}

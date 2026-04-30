@@ -7,6 +7,81 @@ import {
 } from '../utils/metricHelpers'
 import './Dashboard.css'
 
+type PollutantGuidance = {
+  title: string
+  isNormal: boolean
+  fixes?: string[]
+}
+
+const getPollutantGuidance = (prediction?: string): PollutantGuidance => {
+  const normalized = (prediction || '').trim().toLowerCase()
+
+  if (!normalized || normalized === 'normal' || normalized === 'window') {
+    return {
+      title: 'Normal',
+      isNormal: true,
+    }
+  }
+
+  if (normalized === 'smoking') {
+    return {
+      title: 'Smoking',
+      isNormal: false,
+      fixes: [
+        'Stop smoking indoors and move all smoking activity outside.',
+        'Open windows and run an exhaust fan for at least 20-30 minutes.',
+        'Run a HEPA + activated carbon air purifier near the affected area.',
+      ],
+    }
+  }
+
+  if (normalized === 'vape') {
+    return {
+      title: 'Vape Aerosol',
+      isNormal: false,
+      fixes: [
+        'Avoid vaping indoors to prevent aerosol buildup in enclosed areas.',
+        'Increase fresh air intake immediately with windows or mechanical ventilation.',
+        'Use an air purifier with carbon filtration to reduce residual VOCs.',
+      ],
+    }
+  }
+
+  if (normalized === 'candle') {
+    return {
+      title: 'Candle Emissions',
+      isNormal: false,
+      fixes: [
+        'Extinguish candles and avoid continuous burning in low-airflow rooms.',
+        'Ventilate the room and clean soot-prone surfaces nearby.',
+        'Use unscented, low-soot alternatives only when ventilation is adequate.',
+      ],
+    }
+  }
+
+  if (normalized === 'paper') {
+    return {
+      title: 'Paper/Combustion Particles',
+      isNormal: false,
+      fixes: [
+        'Stop any burning source immediately and isolate the affected space.',
+        'Ventilate aggressively and keep doors open to flush indoor air.',
+        'Run a HEPA purifier at high speed until PM levels stabilize.',
+      ],
+    }
+  }
+
+  return {
+    title: prediction || 'Unknown Source',
+    isNormal: false,
+    fixes: [
+      'Increase ventilation and track whether levels decrease within 15-30 minutes.',
+      'Inspect recent activities (cooking, cleaning sprays, smoke, solvents).',
+      'Use filtration and monitor trends before re-occupying enclosed areas.',
+    ],
+  }
+}
+
 export const Dashboard = () => {
   const { data, loading, error } = useAirQuality()
 
@@ -45,6 +120,8 @@ export const Dashboard = () => {
       </div>
     )
   }
+
+  const pollutantGuidance = getPollutantGuidance(data.prediction)
 
   return (
     <div className="dashboard">
@@ -117,6 +194,30 @@ export const Dashboard = () => {
           color="#9333ea"
         />
       </div>
+
+      <section className="pollutant-detection">
+        <h2>Pollutant Detection</h2>
+        <p className={`pollutant-badge ${pollutantGuidance.isNormal ? 'normal' : 'alert'}`}>
+          {pollutantGuidance.isNormal ? 'NORMAL' : pollutantGuidance.title.toUpperCase()}
+        </p>
+        {pollutantGuidance.isNormal ? (
+          <p className="pollutant-subtitle">
+            Air quality is stable. No corrective action needed.
+          </p>
+        ) : (
+          <>
+            <p className="pollutant-subtitle">
+              Detected source: <strong>{pollutantGuidance.title}</strong>
+            </p>
+            <h3>Ways to Fix It</h3>
+            <ul>
+              {pollutantGuidance.fixes?.map((fix) => (
+                <li key={fix}>{fix}</li>
+              ))}
+            </ul>
+          </>
+        )}
+      </section>
 
       {data.created_at && (
         <div className="last-updated">

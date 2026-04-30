@@ -8,6 +8,7 @@ export interface AirQualityData {
   pm10: number // µg/m³
   carbon_monoxide: number // ppm
   voc: number // ppb (parts per billion) - Volatile Organic Compounds
+  prediction?: string
   created_at?: string
   timestamp?: string
 }
